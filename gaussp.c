@@ -1,268 +1,235 @@
-
 #include <stdlib.h>
 #include <stdio.h>
-	 
-#include <sys/time.h>
-#include <time.h>
-
-#include <errno.h>
-
-//neww
 #include <string.h>
 #include <math.h>
-
-//sibling
+#include <sys/time.h>
 #include <sys/types.h>
+
 #include "pvm3.h"
 
-#define GRPNAME "tokenring"
+#define GRPNAME "grupinhoS2"
+#define PIVOT_TAG 101
+#define GATHER_TAG 102
 
+// each process keeps its own rows, simple and pratico
+int local_rows(int N, int me, int nproc) {
+  if (me >= N) {
+    return 0;
+  }
+  return (N - 1 - me) / nproc + 1;
+}
 
-void matrix_load ( char nom[], double *tab, int N , int me, int tids[], int nproc) {
-  int k, j;
-  int local_count = 0;
-  int my_rows = 0;
-  int target;
-  double *row_buf = NULL;
-  FILE *f = NULL;
-   
-  printf("\n %d  Funcionando\n", me);
-	
+void matrix_load(char nom[], double *tab, int N, int me, int tids[], int nproc) {
+  FILE *f;
+  double *row;
+  int i, j, target, count;
+
+  count = local_rows(N, me, nproc);
+
   if (me == 0) {
-	printf("[P0] A tentar abrir o ficheiro: %s\n", nom);
-    if ((f = fopen (nom, "r")) == NULL) { 
-      perror ("matrix_load : fopen "); 
-      pvm_exit();
-      exit(-1);
-    } 
-	 
-	printf("[P0] Ficheiro aberto com sucesso!\n");
-	  
-    row_buf = (double *)malloc(N * sizeof(double));
-    if (row_buf == NULL) {
-      perror("matrix_load : malloc ");
-      pvm_exit();
-      exit(-1);
-    }
+    // process zero reads the file then distribui the rows
+    f = fopen(nom, "r");
+    row = malloc(N * sizeof(double));
 
-    for (k = 0; k < N; k++) {
-		printf("\n outra coisa %d \n", me);
-      // Read one line from file
+    for (i = 0; i < N; i++) {
       for (j = 0; j < N; j++) {
-        fscanf (f, "%lf", &row_buf[j]);
+        fscanf(f, "%lf", &row[j]);
       }
 
-      target = k % nproc;
+      target = i % nproc;
       if (target == 0) {
-        // Store in local buffer of P0 
         for (j = 0; j < N; j++) {
-          *(tab + local_count * N + j) = row_buf[j];
+          tab[(i / nproc) * N + j] = row[j];
         }
-        local_count++;
       } else {
-        // Send row to target process
         pvm_initsend(PvmDataDefault);
-        pvm_pkdouble(row_buf, N, 1);
-        pvm_send(tids[target], 101);
+        pvm_pkdouble(row, N, 1);
+        pvm_send(tids[target], PIVOT_TAG);
       }
     }
 
-    fclose (f);
-    free(row_buf);
-
-  // Worker processes receive their assigned cyclic rows */
+    fclose(f);
+    free(row);
   } else {
-    /* Calculate expected local rows count */
-    for (k = 0; k < N; k++) {
-      if (k % nproc == me) {
-		printf("\n alguma coisa %d \n", me);  
-        my_rows++;
-      }
-    }
-
-    /* Receive rows sequentially from Process 0 */
-    for (k = 0; k < my_rows; k++) {
-      pvm_recv(tids[0], 101);
-      pvm_upkdouble((tab + k * N), N, 1);
+    for (i = 0; i < count; i++) {
+      pvm_recv(tids[0], PIVOT_TAG);
+      pvm_upkdouble(&tab[i * N], N, 1);
     }
   }
-  
 }
 
-void matrix_save ( char nom[], double *tab, int N , int me, int tids[], int nproc  ) {
+void matrix_save(char nom[], double *tab, int N, int me, int tids[], int nproc) {
   FILE *f;
-  int i,j;
+  double *rows;
+  char output[255];
+  int i, count, source;
+
+  count = local_rows(N, me, nproc);
 
   if (me == 0) {
-    if ((f = fopen (nom, "w")) == NULL) { perror ("matrix_save : fopen "); } 
-    for (i=0; i<N; i++) {
-      for (j=0; j<N; j++) {
-        fprintf (f, "%8.2f ", *(tab+i*N+j) );
+    // here we put the rows back in the original order
+    rows = malloc(N * N * sizeof(double));
+    for (i = 0; i < count; i++) {
+      memcpy(&rows[(i * nproc) * N],
+             &tab[i * N],
+             N * sizeof(double));
+    }
+
+    for (source = 1; source < nproc; source++) {
+      int source_count = local_rows(N, source, nproc);
+      int row;
+      double *source_rows = malloc(source_count * N * sizeof(double));
+
+      pvm_recv(tids[source], GATHER_TAG);
+      pvm_upkdouble(source_rows, source_count * N, 1);
+      for (row = 0; row < source_count; row++) {
+        memcpy(&rows[(source + row * nproc) * N],
+               &source_rows[row * N],
+               N * sizeof(double));
       }
-      fprintf (f, "\n");
+      free(source_rows);
     }
-    fclose (f);
+
+    strcpy(output, nom);
+    strcat(output, ".result");
+    f = fopen(output, "w");
+    for (i = 0; i < N * N; i++) {
+      fprintf(f, "%8.2f%c", rows[i], (i % N == N - 1) ? '\n' : ' ');
+    }
+    fclose(f);
+    free(rows);
+  } else {
+    pvm_initsend(PvmDataDefault);
+    pvm_pkdouble(tab, count * N, 1);
+    pvm_send(tids[0], GATHER_TAG);
   }
 }
 
-void matrix_display ( double *tab,int  N ) {
-  int i,j;
+void gauss(double *tab, int N, int me, int tids[], int nproc) {
+  double *pivot_row;
+  double factor;
+  int k, i, j, owner, owner_row, count;
+  int *receivers;
+  int receiver_count;
 
-  for (i=0; i<N; i++) {
-    for (j=0; j<N; j++) {
-      printf ("%8.2f ", *(tab+i*N+j) );
-    }
-    printf ("\n");
-  }
+  pivot_row = malloc(N * sizeof(double));
+  receivers = malloc((nproc - 1) * sizeof(int));
 
-}
+  for (k = 0; k < N - 1; k++) {
+    // the pivot owner shares the line so everybody can calculare
+    owner = k % nproc;
+    owner_row = k / nproc;
 
-void gauss ( double * tab, int N ) {
-  int i,j,k;
-  double pivot;
-
-  for ( k=0; k<N-1; k++ ){ /* mise a 0 de la col. k */
-    /* printf (". "); */
-    if ( fabs(*(tab+k+k*N)) <= 1.0e-11 ) {
-      printf ("ATTENTION: pivot %d presque nul: %g\n", k, *(tab+k+k*N) );
-      exit (-1);
-    }
-    for ( i=k+1; i<N; i++ ){ /* update lines (k+1) to (n-1) */
-      pivot = - *(tab+k+i*N) / *(tab+k+k*N);
-      for ( j=k; j<N; j++ ){ /* update elts (k) - (N-1) of line i */
-	*(tab+j+i*N) = *(tab+j+i*N) + pivot * *(tab+j+k*N);
+    if (me == owner) {
+      for (j = 0; j < N; j++) {
+        pivot_row[j] = tab[owner_row * N + j];
       }
-      /* *(tab+k+i*N) = 0.0; */
+
+      receiver_count = 0;
+      for (i = 0; i < nproc; i++) {
+        if (i != owner) {
+          receivers[receiver_count++] = tids[i];
+        }
+      }
+      pvm_initsend(PvmDataDefault);
+      pvm_pkdouble(pivot_row, N, 1);
+      pvm_mcast(receivers, receiver_count, PIVOT_TAG);
+    } else {
+      pvm_recv(tids[owner], PIVOT_TAG);
+      pvm_upkdouble(pivot_row, N, 1);
+    }
+
+    count = local_rows(N, me, nproc);
+    for (i = 0; i < count; i++) {
+      int global_row = me + i * nproc;
+      if (global_row > k) {
+        // each process updates only its local work
+        factor = tab[i * N + k] / pivot_row[k];
+        for (j = k + 1; j < N; j++) {
+          tab[i * N + j] -= factor * pivot_row[j];
+        }
+        tab[i * N + k] = 0.0;
+      }
     }
   }
-  printf ("\n");
+
+  free(receivers);
+  free(pivot_row);
 }
+
+int dowork(int argc, char **argv, int me, int tids[], int nproc) {
+  int N;
+  double *tab;
+  struct timeval start, end;
+  double elapsed;
+
+  if (argc != 3) {
+    printf("Usage: %s <matrix size> <matrix name>\n", argv[0]);
+    exit(-1);
+  }
+
+  N = atoi(argv[1]);
+  tab = malloc(N * N * sizeof(double));
+
+  matrix_load(argv[2], tab, N, me, tids, nproc);
+  pvm_barrier(GRPNAME, nproc);
+
+  // only the elimination time counts for the speedup
+  if (me == 0) {
+    gettimeofday(&start, (struct timezone *)0);
+  }
+  gauss(tab, N, me, tids, nproc);
+  pvm_barrier(GRPNAME, nproc);
+  if (me == 0) {
+    gettimeofday(&end, (struct timezone *)0);
+    elapsed = (end.tv_sec - start.tv_sec) +
+              (end.tv_usec - start.tv_usec) / 1000000.0;
+    printf("computation time: %10.8f sec.\n", elapsed);
+  }
+
+  matrix_save(argv[2], tab, N, me, tids, nproc);
+  free(tab);
+  return 0;
+}
+
 /*
-int dowork (int argc, char **argv, int me, int tids[], int nproc ) {
-  int N, i, j, k;
-  double *tab, pivot;
-  char nom[255];
-  FILE *f;
-  struct timeval tv1, tv2;	//for timing
-  int duree;
-  
-  if (argc != 3){
-    printf ("Usage: %s <matrix size> <matrix name>\n", argv[0]);
-    exit (-1);
-  } 
-  N = atoi ( argv[1] );
-  strcpy(nom, argv[2]);
-  if ( (tab=malloc(N*N*sizeof(double))) == NULL ) {
-    printf ("Cant malloc %d bytes\n", N*N*sizeof(double));
-    exit (-1);
+// dowork pra testar save e load
+int dowork_test(int argc, char **argv, int me, int tids[], int nproc) {
+  int N;
+  double *tab;
+
+
+  if (argc != 3) {
+    printf("Usage: %s <matrix size> <matrix name>\n", argv[0]);
+    exit(-1);
   }
-  gettimeofday( &tv1, (struct timezone*)0 );
-      matrix_load ( nom , tab, N,  me, tids, nproc  );
-  gettimeofday( &tv2, (struct timezone*)0 );
-  duree = (tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec - tv1.tv_usec;
-  printf ("loading time: %10.8f sec.\n", duree/1000000.0 );
 
-  gettimeofday( &tv1, (struct timezone*)0 );
-      //gauss ( tab, N );
-  gettimeofday( &tv2, (struct timezone*)0 );
-  duree = (tv2.tv_sec - tv1.tv_sec) * 1000000 + tv2.tv_usec - tv1.tv_usec;
-  printf ("computation time: %10.8f sec.\n", duree/1000000.0 );
+  N = atoi(argv[1]);
+  tab = malloc(N * N * sizeof(double));
 
-  sprintf ( nom+strlen(nom), ".result" );
-  matrix_save ( nom, tab, N ,  me, tids, nproc );
+  matrix_load(argv[2], tab, N, me, tids, nproc);
+  pvm_barrier(GRPNAME, nproc);
+  matrix_save(argv[2], tab, N, me, tids, nproc);
+  free(tab);
+  return 0;
 }*/
 
-int dowork (int argc, char **argv, int me, int tids[], int nproc ) {
-  int N, i, j, k;
-  double *tab, pivot;
-  char nom[255];
-  FILE *f;
-  struct timeval tv1, tv2;	//for timing
-  int duree;
-  
-  if (argc != 3){
-    printf ("Usage: %s <matrix size> <matrix name>\n", argv[0]);
-    exit (-1);
-  } 
-  N = atoi ( argv[1] );
-  strcpy(nom, argv[2]);
-  if ( (tab=malloc(N*N*sizeof(double))) == NULL ) {
-    printf ("Cant malloc %d bytes\n", N*N*sizeof(double));
-    exit (-1);
+
+int main(int argc, char **argv) {
+  int nproc, mytid, *tids, me, i;
+
+  mytid = pvm_mytid();
+  nproc = pvm_siblings(&tids);
+  me = pvm_joingroup(GRPNAME);
+  pvm_barrier(GRPNAME, nproc);
+  pvm_freezegroup(GRPNAME, nproc);
+  for (i = 0; i < nproc; i++) {
+    tids[i] = pvm_gettid(GRPNAME, i);
   }
 
-  matrix_load (nom , tab, N,  me, tids, nproc  );
+  dowork(argc, argv, me, tids, nproc);
 
-  matrix_display (tab, N );
-  matrix_save ( nom, tab, N ,  me, tids, nproc );
+  pvm_lvgroup(GRPNAME);
+  pvm_exit();
+  return 0;
 }
-
-/*  tokenring example using PVM 3.4 
-    - uses sibling() to determine the nb of spawned tasks (xpvm and pvm> ok)
-    - uses group for token ring communication
-*/
-
-
-int main(int argc, char ** argv) {
-    int NPROC = 8;		/* default nb of proc */
-    int mytid;                  /* my task id */
-    int *tids;                  /* array of task id */
-    int me;                     /* my process number */
-    int i;
-
-    /* enroll in pvm */
-    mytid = pvm_mytid();
-
-    /* determine the size of my sibling list */
-    NPROC = pvm_siblings(&tids); 
-    /* WARNING: tids are in order of spawning, which is different from
-       the task index JOINING the group */
-
-    me = pvm_joingroup( GRPNAME ); /* me: task index in the group */
-    pvm_barrier( GRPNAME, NPROC );
-    pvm_freezegroup ( GRPNAME, NPROC );
-    for ( i = 0; i < NPROC; i++) tids[i] = pvm_gettid ( GRPNAME, i); 
-
-/*--------------------------------------------------------------------------*/
-/*           all the tasks are equivalent at that point                     */
-
-     //printf("Main process: %d", me);
-	
-	 dowork(argc, argv, me, tids, NPROC );
-
-     pvm_lvgroup( GRPNAME );
-     pvm_exit();
-	
-	return 0;
-}
-
-/* Simple example passes a token around a ring */
-/*
-int dowork( int me, int tids[], int nproc ) {
-     int token;
-     int src, dest;
-     int count  = 1;
-     int stride = 1;
-     int msgtag = 4;
-
-     //Determine neighbors in the ring 
-     src = pvm_gettid (GRPNAME, (me - 1 + nproc) % nproc );
-     dest= pvm_gettid (GRPNAME, (me + 1) % nproc );
-     if( me == 0 ) { 
-        token = dest;
-        pvm_initsend( PvmDataDefault );
-        pvm_pkint( &token, count, stride );
-        pvm_send( dest, msgtag );
-        pvm_recv( src, msgtag );
-     }
-     else {
-        pvm_recv( src, msgtag );
-        pvm_upkint( &token, count, stride );
-        pvm_initsend( PvmDataDefault );
-        pvm_pkint( &token, count, stride );
-        pvm_send( dest, msgtag );
-     }
-     printf("P%d (%x) token ring done\n", me, pvm_mytid());
-	return 0;
-}
-*/
